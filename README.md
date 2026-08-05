@@ -25,10 +25,10 @@ per-dimension breakdown, validation status, and FinBERT sentiment for auditing.
 |---------|--------|-------|
 | Store | PostgreSQL + pgvector | metadata + vectors + holdings + audit in one DB |
 | Embeddings | Qwen3-Embedding-0.6B | tops MTEB multilingual, Apache-2.0, CPU-friendly |
-| LLM Judge | Groq → Google → Ollama | provider-agnostic fallback chain, free-tier first |
+| LLM Judge | Ollama (normal) + Groq → Google (premium) | Ollama scores every article; premium tier only steps in for dispute resolution and report summaries |
 | Sentiment | ProsusAI/FinBERT | directional signal; lazy-loaded, optional |
 | Dedup | content_hash (SHA-256) | idempotent ingest across re-runs |
-| Resolver | exact ISIN/ticker → alias fuzzy → sector | no NER needed for fixed portfolio |
+| Resolver | exact ISIN/ticker → alias → fuzzy → subsidiary → sector | no NER needed for fixed portfolio |
 
 ## Setup
 
@@ -37,6 +37,7 @@ per-dimension breakdown, validation status, and FinBERT sentiment for auditing.
 createdb finrag
 psql -d finrag -f sql/001_schema.sql
 psql -d finrag -f sql/002_validation.sql
+psql -d finrag -f sql/003_subsidiaries.sql
 
 # 2. Python environment
 python -m venv .venv && source .venv/bin/activate
@@ -83,9 +84,10 @@ python -m scripts.chat "What's happening with Reliance?" # one-shot
 ```
 
 Retrieval: embed the question (Qwen3), pull ANN candidates from pgvector,
-rerank with the cross-encoder, ground the same Groq→Google→Ollama LLM chain
-used for scoring (see `finrag/chat/`). Requires articles to already have
-embeddings (i.e. the resolve/score stages have run at least once).
+rerank with the cross-encoder, ground the same normal-tier Ollama judge used
+for routine scoring (see `finrag/chat/`) — chat never spends premium-tier
+calls. Requires articles to already have embeddings (i.e. the resolve/score
+stages have run at least once).
 
 ## Scoring
 
@@ -93,9 +95,9 @@ Each article–holding pair is scored on four dimensions (1–10):
 
 | Dimension | Weight | Meaning |
 |-----------|--------|---------|
+| `materiality` | 40% | Would this move a rational investor's decision? |
 | `direct_relevance` | 35% | Is this article directly about this holding? |
-| `materiality` | 35% | Would this move a rational investor's decision? |
-| `urgency` | 20% | Is this time-sensitive? |
+| `urgency` | 15% | Is this time-sensitive? |
 | `credibility` | 10% | How authoritative is the source? |
 
 `composite = weighted average`, then **rule floors** apply for deterministic
@@ -104,6 +106,18 @@ event types (e.g. `sebi_enforcement` floors at 8.0, `fraud_disclosure` at 9.0).
 Articles with `composite > SCORE_THRESHOLD` (default 5.0) appear in the digest.
 Articles with `composite > IMMEDIATE_THRESHOLD` (default 8.0) are flagged
 high-priority.
+
+**LLM judge — two tiers, not a single fallback chain:**
+- **Normal** (`get_judge()`): Ollama only, every article×holding pair. No
+  cloud fallback — raises loudly if Ollama isn't reachable rather than
+  silently spending a premium-tier call.
+- **Premium** (`get_premium_judge()`): Groq → Google, used *only* for
+  dispute resolution — re-scoring a row the validator below flagged or
+  rejected. Its verdict is final and is logged to
+  `logs/dispute_verdicts.csv` (`finrag/score/dispute_log.py`) for audit.
+  The same premium tier also writes the digest's executive summary
+  (`finrag/report/summarize.py`) — the only other place a paid/free-cloud
+  call happens.
 
 ## Validation
 
@@ -116,11 +130,11 @@ After scoring, every row is annotated with a `validation_status`:
 | `rejected` | Score is structurally invalid (e.g. judge error) |
 
 **Structural checks (A–E):**
-- Low credibility vs high composite
-- Materiality–credibility mismatch for regulator sources
-- Rule-floor event with low materiality
-- Sector-only match with high composite
-- Known-negative event type with high composite
+- `schema_invalid` — a dimension is out of range or `event_type` is empty (rejects the row outright)
+- `event_type_unrecognized` — judge's `event_type` isn't a known label (suppressed when a rule floor fired)
+- `credibility_authority_mismatch` — regulator source scored low-credibility, or a low-authority source scored very high
+- `relevance_resolver_mismatch` — resolver matched by ISIN/ticker/exact alias but the judge scored `direct_relevance` low
+- `floor_materiality_mismatch` — a rule floor fired but the judge scored `materiality` low
 
 **FinBERT coherence checks (F–G):**
 - `sentiment_floor_conflict` — negative event floor but FinBERT reads positive
@@ -165,63 +179,67 @@ Evaluation notebook: `eval_metrics.ipynb`
 
 ```
 finrag/
-  config.py               env-driven settings + source catalogue
-  orchestrate.py          run_once(): sequences all stages, isolates errors
-  scheduler.py            APScheduler fast/slow cycles
+  config.py                 env-driven settings + source catalogue
+  orchestrate.py            run_once(): sequences all stages, isolates errors
+  scheduler.py              APScheduler fast/slow cycles
   store/
-    db.py                 SQLAlchemy 2.0 ORM models
-    holdings_seed.py      portfolio definition (edit this)
+    db.py                   SQLAlchemy 2.0 ORM models
+    holdings_seed.py        portfolio definition (edit this)
+    subsidiaries_seed.py    subsidiary -> parent-holding map (edit this)
   ingest/
-    base.py               RawItem, normalisation, content_hash dedup
-    http.py               rate-limited, retrying HTTP client
-    rss.py                generic RSS adapter + feed registry
-    nse.py                NSE corporate filings adapter
-    rbi.py                RBI circulars adapter
-    pipeline.py           run_source(): persist, dedup, log
+    base.py                 RawItem, normalisation, content_hash dedup
+    http.py                 rate-limited, retrying HTTP client
+    rss.py                  generic RSS adapter + feed registry
+    nse.py                  NSE corporate filings adapter
+    rbi.py                  RBI circulars adapter
+    pipeline.py             run_source(): persist, dedup, log
   process/
-    gazetteer.py          compile holdings into fast matchers
-    resolve.py            4-level resolution cascade
-    pipeline.py            apply resolver, advance article status
-    embed.py              Qwen3 embeddings + cross-encoder reranker
+    gazetteer.py            compile holdings + subsidiaries into fast matchers
+    resolve.py              5-level resolution cascade
+    pipeline.py             apply resolver, advance article status
+    embed.py                Qwen3 embeddings + cross-encoder reranker
   score/
-    judge.py              provider-agnostic LLM judge (Groq/Google/Ollama)
-    rubric.py             4-dim prompt, weighted composite, rule floors
-    sentiment.py          FinBERT directional sentiment (lazy-loaded)
-    validate.py           structural + sentiment coherence checks
-    pipeline.py            embed → retrieve → judge → floor → validate → persist
+    judge.py                two-tier LLM judge: normal (Ollama), premium (Groq/Google)
+    rubric.py               4-dim prompt, weighted composite, rule floors
+    sentiment.py            FinBERT directional sentiment (lazy-loaded)
+    validate.py             structural + sentiment coherence checks
+    dispute_log.py          CSV audit trail for premium dispute resolution
+    pipeline.py             embed -> retrieve -> judge -> floor -> validate -> dispute -> persist
   calibration/
-    validate_report.py    read-only validation summary query helper
+    validate_report.py      read-only validation summary query helper
   report/
-    render.py             HTML + plain-text digest renderer
-    pipeline.py           select unreported → render → send → mark reported
+    render.py               HTML + plain-text digest renderer
+    summarize.py            premium-tier executive summary for the digest
+    pipeline.py             select unreported -> render -> send -> mark reported
   deliver/
-    email.py              SMTP delivery with dry-run mode
+    email.py                SMTP delivery with dry-run mode
   chat/
-    retrieve.py           semantic search (pgvector + rerank) + holding matching
-    llm.py                provider-agnostic freeform chat (Groq/Google/Ollama)
-    bot.py                builds grounded prompt, calls llm, returns answer+sources
+    retrieve.py             semantic search (pgvector + rerank) + holding matching
+    llm.py                  normal (Ollama) / premium (Groq/Google) chat completion
+    bot.py                  builds grounded prompt, calls normal-tier llm, returns answer+sources
 
 scripts/
-  seed.py                 seed portfolio holdings
-  ingest.py               run ingest stage
-  resolve.py              run resolve stage
-  score.py                run score stage
-  report.py               run report stage
-  run.py                  full pipeline (or --schedule)
-  chat.py                 interactive chatbot REPL (or one-shot question)
+  seed.py                   seed sources, portfolio holdings, and subsidiaries
+  ingest.py                 run ingest stage
+  resolve.py                run resolve stage
+  score.py                  run score stage
+  report.py                 run report stage
+  run.py                    full pipeline (or --schedule)
+  chat.py                   interactive chatbot REPL (or one-shot question)
   calibration/
-    validation_report.py     print validation health report
-    harvest.py                one-time calibration batch (explicit limit/delay)
-    export_label_dataset.py  export labelling CSVs from scored rows
-    compute_label_metrics.py compute P/R/F1 from filled labelling CSVs
+    validation_report.py      print validation health report
+    harvest.py                 one-time calibration batch (explicit limit/delay)
+    export_label_dataset.py    export labelling CSVs from scored rows
+    compute_label_metrics.py   compute P/R/F1 from filled labelling CSVs
 
 sql/
-  001_schema.sql          base DDL (articles, holdings, scores, sources)
-  002_validation.sql      validation columns migration
+  001_schema.sql            base DDL (articles, holdings, scores, sources)
+  002_validation.sql        validation columns migration
+  003_subsidiaries.sql      subsidiaries reference table
 
-eval_metrics.ipynb        calibration evaluation report with charts
+eval_metrics.ipynb          calibration evaluation report with charts
 
-tests/                    78 unit tests (pytest -q -m "not slow")
+tests/                      17 unit tests (pytest -q -m "not slow")
 ```
 
 ## Environment Variables

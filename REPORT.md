@@ -1,4 +1,4 @@
-# finRAG — Financial News Intelligence Bot
+# finRAG — Financial News Intelligence Pipeline
 ## Technical Project Report: Architecture, Methodology & Results
 
 **Version 1.1 · July 2026**
@@ -37,8 +37,8 @@ The system is built around three core design principles:
 
 | Metric | Value |
 |---|---|
-| Active sources | 9 (7 RSS-based, 2 custom scrapers) |
-| RSS feeds | 21 across 5 publishers |
+| Active sources | 8 (6 RSS-based, 2 custom scrapers); BSE_ANN cataloged but disabled |
+| RSS feeds | 21 across 6 publishers |
 | Score threshold | 5.0 (immediate alert at 8.0) |
 | Embedding dimension | 1024 (Qwen3-Embedding-0.6B) |
 
@@ -177,14 +177,17 @@ The resolver links each ingested article to one or more portfolio holdings. This
 
 ### 5.1 Resolution Cascade
 
-Four methods are tried in descending confidence order. Once a holding is matched by a higher-confidence method, lower-confidence methods are skipped for that holding.
+Five methods are tried in descending confidence order. Once a holding is matched by a higher-confidence method, lower-confidence methods are skipped for that holding.
 
 | Priority | Method | Confidence | Mechanism |
 |---|---|---|---|
 | 1 | `exact_id` | 1.00 | NSE symbol / BSE code / ISIN as standalone token |
 | 2 | `alias_exact` | 0.95 | Curated alias as word-boundary phrase (case-insensitive) |
 | 3 | `alias_fuzzy` | score | RapidFuzz `token_set_ratio` ≥ 90, head word present |
-| 4 | `sector` | 0.40 | Sector cue regex, only when no company match found |
+| 4 | `subsidiary` | 0.90 | Subsidiary/brand name whose direct listed parent is a current holding |
+| 5 | `sector` | 0.40 | Sector cue regex, only when no company match found |
+
+`subsidiary` resolves via a separate registry (`finrag/store/subsidiaries_seed.py`, seeded into the `subsidiaries` table by `sql/003_subsidiaries.sql`) that maps a subsidiary/brand name to its direct listed parent's NSE symbol. A row whose parent isn't currently a holding is inert — it produces no link until that parent is added to the portfolio.
 
 ### 5.2 Ambiguity Resolution
 
@@ -225,27 +228,21 @@ The reranker (**Qwen/Qwen3-Reranker-0.6B**, a cross-encoder) jointly encodes que
 
 ### 6.3 Context Retrieval for Scoring
 
-When scoring an article against a holding, up to *k* prior scored articles are retrieved as grounding context for the judge. The retrieval query enforces two quality properties:
+When scoring an article against a holding, prior scored articles are retrieved as grounding context for the judge in **two independent scopes**, each queried and selected separately (`finrag/score/pipeline.py`):
 
-1. **Authority penalty:** vector distance is adjusted by `(authority_rank − 1) × 0.05`, so a regulator article (rank 1) scores as if it were 0.15 closer than an aggregator (rank 4) with identical embedding similarity.
+- **Company scope:** other scored articles about this same holding.
+- **Sector scope:** scored articles about *other* holdings in the same sector (skipped if the holding has no sector).
 
-2. **Kind diversity:** `DISTINCT ON (src.kind)` ensures context slots are filled with one best article per source kind (regulator, wire, aggregator) — not three paraphrases of the same story from competing wires.
+For each scope, a candidate pool is fetched first — the `pool_k` nearest articles by cosine similarity, UNIONed with the `pool_k` most recent by `published_at` — so the selection step below isn't starved by articles that only ever rank on one axis. `pool_k = max(context_max_k, context_min_k)`.
 
-```sql
-select title, event_type, composite, source_name from (
-    select distinct on (src.kind)
-        a.title, sc.event_type, sc.composite, src.name as source_name
-    from scores sc
-    join articles a on a.id = sc.article_id
-    join sources src on src.id = a.source_id
-    where sc.holding_id = :hid and a.id <> :aid
-      and a.embedding is not null
-    order by src.kind,
-        (a.embedding <=> CAST(:emb AS vector))
-        + (src.authority_rank - 1) * 0.05::double precision
-) ranked
-limit :k
-```
+From that pool, articles are selected two ways and unioned (deduped by article id):
+
+1. **By similarity:** cosine similarity ≥ `context_similarity_min` (0.55), capped at `context_max_k` (6).
+2. **By recency:** `published_at` within `context_recency_hours` (72h), capped at `context_max_k` (6).
+
+If the union comes up short of `context_min_k` (3) — e.g. a thin corpus early on — it is backfilled by nearest similarity until the floor is met, so the judge always gets a baseline of context when any prior coverage exists.
+
+The two scopes are formatted into separate labelled blocks ("Company history: …" / "Sector context: …") and joined into the prompt's `RETRIEVED CONTEXT` field. Source `authority_rank` is not folded into this retrieval query — it is instead passed to the judge directly in the prompt (§7.2) so the model, not the retrieval SQL, weighs it.
 
 ---
 
@@ -302,22 +299,30 @@ Deterministic regex patterns override the LLM composite for known high-materiali
 
 ## 8. LLM Judge Infrastructure
 
-The judge layer is provider-agnostic. Three backends are wired in a fallback chain; all enforce structured JSON output.
+The judge layer is **two-tier, not a single fallback chain**: a free local model scores every article, and paid/free-cloud providers are reserved for the two situations that actually need a second opinion — a disputed score and the digest's narrative summary. All backends enforce structured JSON output.
 
-| Provider | Model | Tier | Structured Output |
+| Tier | Provider | Model | Structured Output |
 |---|---|---|---|
-| Groq | `llama-3.3-70b-versatile` | Free (30 RPM / daily cap) | `response_format: json_object` |
-| Google AI Studio | `gemini-2.5-flash` | Free (daily quota) | `responseSchema` (strict) |
-| Ollama (local) | `qwen2.5:7b-instruct` | Free, offline, private | Native JSON schema format |
+| Normal | Ollama (local) | `qwen2.5:7b-instruct` | Native JSON schema format |
+| Premium | Groq | `llama-3.3-70b-versatile` | `response_format: json_object` |
+| Premium | Google AI Studio | `gemini-2.0-flash` | `responseSchema` (strict) |
 
-**Fallback logic:** `FallbackJudge` advances to the next provider on `DailyLimitError`. Transient rate limits (429 RPM) are retried with exponential backoff via tenacity (8 attempts, 10–120s wait). The active provider index persists across all articles in one cycle — a single Groq quota exhaustion causes exactly one fallback switch per run, not one per article.
+### 8.1 Normal tier — `get_judge()`
 
-**Fallback chain at runtime:**
+Every resolved article×holding pair is scored by Ollama, and only Ollama. There is no cloud fallback here by design: local inference is free with no daily quota, and `get_judge()` raises loudly if Ollama is unreachable rather than silently burning a premium call on routine scoring.
+
+### 8.2 Premium tier — `get_premium_judge()`
+
+Groq → Google is a fallback chain, but it is invoked *only* to resolve a dispute: a row the deterministic validator (§9) marked `flagged` or `rejected`. The premium verdict is final — it overwrites the normal-tier score's dimensions, composite, and `event_type` outright — and the swap (both verdicts, side by side) is appended to `logs/dispute_verdicts.csv` via `finrag/score/dispute_log.py` for audit. If neither provider is configured, disputed rows are simply left as `flagged`/`rejected`.
+
+The same premium chain also powers `finrag/report/summarize.py`, which writes the 2–3 sentence executive summary at the top of each digest — the one place in the pipeline that generates free-text narrative rather than a structured score. If no premium provider is configured, the digest still sends, just without that paragraph.
+
+**Fallback logic (within the premium tier):** `FallbackJudge`/`FallbackChat` advances Groq → Google on `DailyLimitError`. Transient rate limits (429 RPM) are retried with exponential backoff via tenacity (8 attempts, 10–120s wait). The active provider index persists across the whole run — a single Groq quota exhaustion causes exactly one fallback switch per cycle, not one per dispute.
+
+**Premium fallback chain at runtime:**
 ```
-groq/llama-3.3-70b-versatile → google/gemini-2.5-flash → ollama/qwen2.5:7b-instruct
+groq/llama-3.3-70b-versatile → google/gemini-2.0-flash
 ```
-
-> **Optional paid path:** An Anthropic Claude backend (`claude-sonnet-4-6`) is configured but reserved for report narrative generation rather than per-article scoring.
 
 ---
 
@@ -327,15 +332,15 @@ After scoring, every article–holding pair is annotated with a `validation_stat
 
 ### 9.1 Structural Checks (A–E)
 
-Five deterministic checks run on every scored row using only the score dimensions and metadata — no additional LLM calls.
+Five deterministic checks run on every scored row using only the score dimensions and metadata — no additional LLM calls. Checks run in order; A is reject-level and returns immediately, B–E are additive flags.
 
 | Check | Flag | Condition |
 |-------|------|-----------|
-| A | `credibility_low` | composite > 6.0 but credibility ≤ 3 |
-| B | `regulator_credibility_mismatch` | source is regulator (rank 1) but credibility < 7 |
-| C | `floor_materiality_mismatch` | rule floor fired but materiality < 5 |
-| D | `sector_match_high_composite` | match_method = sector but composite > 7.0 |
-| E | `negative_event_high_composite` | known-negative event type with composite > 7.0 |
+| A | `schema_invalid` | a dimension is missing/out of range, or `event_type` is empty — rejects the row, skips B–E |
+| B | `event_type_unrecognized` | `event_type` isn't in the allowed set (floor events ∪ prompt-template labels ∪ `unknown`/`judge_error`); suppressed when a rule floor fired |
+| C | `credibility_authority_mismatch` | regulator source (`authority_rank == 1`) scored `credibility ≤ 4`, **or** a low-authority source (`authority_rank ≥ 4`) scored `credibility ≥ 9` |
+| D | `relevance_resolver_mismatch` | resolver matched via `exact_id`/`alias_exact` (high confidence) but the judge scored `direct_relevance ≤ 3` |
+| E | `floor_materiality_mismatch` | a rule floor fired but the judge scored `materiality ≤ 3` |
 
 ### 9.2 FinBERT Sentiment Coherence Checks (F–G)
 
@@ -348,7 +353,11 @@ FinBERT (ProsusAI/finbert) produces a directional sentiment label (`positive`, `
 
 FinBERT is **lazy-loaded** on first use and computed **once per article** (not per holding), so an article linked to three holdings incurs a single inference call. When `settings.sentiment_enabled=False` or if the model fails to load, both columns are stored as `NULL` and no sentiment flags are added — scoring proceeds exactly as before.
 
-### 9.3 Validation-Status Distribution
+### 9.3 Dispute Resolution
+
+A row that comes out of §9.1/§9.2 as `flagged` or `rejected` is not left as-is: it is re-scored by the premium judge (§8.2), and that verdict is final. The status is then rewritten to `premium_resolved`, and both verdicts — normal and premium, dimension by dimension — are appended to `logs/dispute_verdicts.csv` (`finrag/score/dispute_log.py`) for audit. This only fires for validator-flagged rows, so it spends premium-tier calls proportionally to how often the normal-tier judge produces an incoherent score, not per article.
+
+### 9.4 Validation-Status Distribution
 
 From the calibration batch (124 scored rows, July 2026):
 
@@ -358,7 +367,7 @@ From the calibration batch (124 scored rows, July 2026):
 | `flagged` | 25 | 20.2% |
 | `rejected` | 0 | 0.0% |
 
-### 9.4 Validation Report
+### 9.5 Validation Report
 
 ```bash
 python -m scripts.calibration.validation_report            # last 7 days
@@ -381,6 +390,7 @@ The report stage selects all above-threshold scored articles not yet included in
 | Subject | `[Portfolio] N item(s) — M urgent` |
 | Dedup | `article_ids` checked against all previously sent reports |
 | Grouping | One row per article; highest composite score wins if multiple holdings matched |
+| Executive summary | 2–3 sentence premium-tier (Groq→Google) narrative opening the digest; digest still sends without it if unconfigured/fails |
 
 ---
 
@@ -504,8 +514,8 @@ At 8s inter-call delay and 20 articles/cycle, a full scoring batch takes ~3 minu
 **A6 — Source feed URLs are stable.**
 RSS feed URLs are hardcoded. Publisher-side URL changes or feed deprecations produce silent zero-fetch cycles, visible only via `ingest_log` monitoring.
 
-**A7 — DISTINCT ON (src.kind) covers all meaningful source diversity.**
-Three kinds (regulator, wire, aggregator) are assumed sufficient to represent distinct informational roles. Exchange kind (NSE filings) is present but would benefit from its own context slot.
+**A7 — Similarity-or-recency selection surfaces sufficiently diverse context.**
+Context retrieval (§6.3) selects by cosine similarity and recency within each scope, with no explicit per-source-kind quota. It is assumed this is enough to avoid handing the judge several near-identical paraphrases of the same story instead of a genuinely varied view — see the "Context diversity" limitation in §14.
 
 ---
 
@@ -518,7 +528,7 @@ Three kinds (regulator, wire, aggregator) are assumed sufficient to represent di
 | BSE | Open | BSE corporate announcements require a browser session | Playwright adapter or BSE data vendor API |
 | Threshold | Eval done | Default 5.0 misses 1 TP vs 4.0 with no extra FP | Lower `SCORE_THRESHOLD` to 4.0 (calibration-confirmed) |
 | Sector fan-out | Open | Sector cues manually authored and sparse | Learned sector classifier using embedding model |
-| Exchange context | Open | NSE filings share `DISTINCT ON` slot with regulators | Separate `exchange` from `regulator` kind in context retrieval |
+| Context diversity | Open | Company/sector context pools are selected by similarity + recency only, with no per-source-kind quota — could surface several near-identical wire paraphrases instead of a genuinely varied view | Reintroduce a diversity constraint (e.g. one slot per source kind) within each scope's selection step |
 | Score drift | Partial | Prompt version tracked; no automated regression test | Freeze labelled eval set; run scorer before/after any model change |
 | Feed monitoring | Open | Silent zero-fetch on URL change — no alerting | Alert on `ingest_log` rows with `fetched=0` and no error for N consecutive cycles |
 | Label coverage | Open | 67 of 124 calibration pairs have blank `gold_material` | Complete labelling pass to improve P/R confidence intervals |

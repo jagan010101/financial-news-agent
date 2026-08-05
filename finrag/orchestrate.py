@@ -1,7 +1,7 @@
 """
 finrag.orchestrate — sequence the full pipeline.
 
-The five stages are independent and idempotent, so orchestration is just
+The four stages are independent and idempotent, so orchestration is just
 ordered sequencing with per-stage error isolation: a failure in one stage is
 logged and the run continues where it sensibly can (e.g. a flaky feed must not
 block scoring of already-ingested items).

@@ -1,0 +1,32 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# virtual envs
+.venv/
+venv/
+env/
+
+# tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# data / generated
+data/
+labelling/*.csv
+logs/*.csv
+
+# HuggingFace model cache (large)
+.cache/
